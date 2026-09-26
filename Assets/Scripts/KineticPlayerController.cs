@@ -1,5 +1,7 @@
 using UnityEngine;
+using UnityEngine.UI;
 using UnityEngine.InputSystem;
+using Unity.Cinemachine;
 
 [RequireComponent(typeof(Rigidbody))]
 public class KineticPlayerController : MonoBehaviour
@@ -8,14 +10,21 @@ public class KineticPlayerController : MonoBehaviour
     public float moveForce = 25f;
     public float maxSpeed = 15f;
 
+    [Header("Energy & Cooldown System")]
+    public float maxEnergy = 100f;
+    public float energyRegenRate = 5f;
+    public float collisionEnergyMultiplier = 0.5f; 
+    public float actionCooldown = 1.5f;
+
     [Header("Linear Anchor Dash")]
     public float anchorMassMultiplier = 10f;
-    public float chargeRate = 25f;
-    public float maxCharge = 100f;
+    public float dashChargeRate = 50f; 
     public float burstForceMultiplier = 40f;
+    public float dashTrailDuration = 0.5f;
 
     [Header("Sonic Anchor (AoE)")]
     public float sonicRadius = 15f;
+    public float sonicChargeRate = 100f; 
     public float sonicExplosionMultiplier = 60f;
     private bool isSonicCharge;
 
@@ -24,17 +33,47 @@ public class KineticPlayerController : MonoBehaviour
     public InputActionReference anchorAction;
     public InputActionReference modifierAction;
 
-    // Internal components and state
+    [Header("UI Elements")]
+    public Slider energySlider;
+    public Slider cooldownSlider;
+
+    [Header("VFX")]
+    public ParticleSystem sonicVFX;
+    public ParticleSystem chargeVFX;
+    public ParticleSystem dashVFX;
+    public TrailRenderer dashTrail;
+
+    [Header("SFX (Audio Clips)")]
+    public AudioClip chargeClip;
+    public AudioClip dashClip;
+    public AudioClip sonicClip;
+    public AudioClip heavyImpactClip;
+    public AudioClip lightImpactClip;
+    public AudioClip normalImpactClip;
+    public AudioClip rollingClip;
+
+    [Header("SFX (Audio Sources)")]
+    public AudioSource mainAudioSource; 
+    public AudioSource rollingAudioSource; 
+
     private Rigidbody rb;
+    private CinemachineImpulseSource impulseSource;
     private Vector2 moveInput;
+    private Vector3 lastMoveDirection = Vector3.forward;
     private bool isAnchored;
     private float currentCharge;
+    private float currentEnergy;
+    private float cooldownTimer;
     private float baseMass;
 
     private void Awake()
     {
         rb = GetComponent<Rigidbody>();
+        impulseSource = GetComponent<CinemachineImpulseSource>();
         baseMass = rb.mass;
+        currentEnergy = maxEnergy;
+
+        if (dashTrail != null) dashTrail.emitting = false;
     }
 
     private void OnEnable()
@@ -42,7 +81,6 @@ public class KineticPlayerController : MonoBehaviour
         moveAction.action.Enable();
         anchorAction.action.Enable();
         modifierAction.action.Enable();
-
         anchorAction.action.started += OnAnchorPressed;
         anchorAction.action.canceled += OnAnchorReleased;
     }
@@ -52,7 +90,6 @@ public class KineticPlayerController : MonoBehaviour
         moveAction.action.Disable();
         anchorAction.action.Disable();
         modifierAction.action.Disable();
-
         anchorAction.action.started -= OnAnchorPressed;
         anchorAction.action.canceled -= OnAnchorReleased;
     }
@@ -60,11 +97,47 @@ public class KineticPlayerController : MonoBehaviour
     private void Update()
     {
         moveInput = moveAction.action.ReadValue<Vector2>();
+        if (moveInput != Vector2.zero) lastMoveDirection = new Vector3(moveInput.x, 0f, moveInput.y).normalized;
+        if (cooldownTimer > 0) cooldownTimer -= Time.deltaTime;
 
         if (isAnchored)
         {
-            currentCharge += chargeRate * Time.deltaTime;
-            currentCharge = Mathf.Clamp(currentCharge, 0f, maxCharge);
+            float activeChargeRate = isSonicCharge ? sonicChargeRate : dashChargeRate;
+            float chargeAmount = activeChargeRate * Time.deltaTime;
+            float maxAbilityCharge = isSonicCharge ? 100f : 50f;
+            float availableCharge = Mathf.Min(chargeAmount, currentEnergy, maxAbilityCharge - currentCharge);
+            currentCharge += availableCharge;
+            currentEnergy -= availableCharge;
+        }
+        else
+        {
+            currentEnergy += energyRegenRate * Time.deltaTime;
+            currentEnergy = Mathf.Clamp(currentEnergy, 0f, maxEnergy);
+        }
+
+        if (energySlider != null) energySlider.value = currentEnergy;
+        if (cooldownSlider != null) cooldownSlider.value = Mathf.Clamp01(cooldownTimer / actionCooldown) * 100f; 
+
+        // --- ROLLING AUDIO LOGIC ---
+        if (rollingClip != null && rollingAudioSource != null)
+        {
+            if (rollingAudioSource.clip == null) rollingAudioSource.clip = rollingClip;
+
+            float currentSpeed = rb.linearVelocity.magnitude;
+            
+            // Only play if moving faster than 0.5f and not actively charging an anchor
+            if (currentSpeed > 0.5f && !isAnchored)
+            {
+                if (!rollingAudioSource.isPlaying) rollingAudioSource.Play();
+                
+                // Dynamically adjust volume and pitch based on speed
+                rollingAudioSource.volume = Mathf.Clamp01(currentSpeed / maxSpeed) * 0.7f; 
+                rollingAudioSource.pitch = 0.8f + (currentSpeed / maxSpeed) * 0.4f; 
+            }
+            else
+            {
+                if (rollingAudioSource.isPlaying) rollingAudioSource.Pause();
+            }
         }
     }
 
@@ -72,26 +145,18 @@ public class KineticPlayerController : MonoBehaviour
     {
         if (isAnchored) return;
 
-        // Active braking when no input is provided
         if (moveInput == Vector2.zero)
         {
-            Vector3 horizontalVelocity = new Vector3(rb.linearVelocity.x, 0f, rb.linearVelocity.z);
             rb.linearVelocity = Vector3.Lerp(rb.linearVelocity, new Vector3(0f, rb.linearVelocity.y, 0f), Time.fixedDeltaTime * 6f);
             rb.angularVelocity = Vector3.Lerp(rb.angularVelocity, Vector3.zero, Time.fixedDeltaTime * 6f);
             return;
         }
 
-        // Map 2D input (X, Y) to 3D world space (X, 0, Z)
         Vector3 moveDirection = new Vector3(moveInput.x, 0f, moveInput.y);
-
-        // Apply pushing force
         rb.AddForce(moveDirection * moveForce, ForceMode.Acceleration);
-
-        // Apply rolling torque (Z and X inverted/swapped for correct rolling direction)
         Vector3 torqueAxis = new Vector3(moveDirection.z, 0f, -moveDirection.x);
         rb.AddTorque(torqueAxis * moveForce, ForceMode.Acceleration);
 
-        // Cap maximum linear velocity
         if (rb.linearVelocity.magnitude > maxSpeed)
         {
             rb.linearVelocity = rb.linearVelocity.normalized * maxSpeed;
@@ -100,66 +165,116 @@ public class KineticPlayerController : MonoBehaviour
 
     private void OnAnchorPressed(InputAction.CallbackContext context)
     {
+        if (cooldownTimer > 0f || currentEnergy < 1f) return;
+
         isAnchored = true;
-
-        // Check if Shift is currently held down when Spacebar is pressed
         isSonicCharge = modifierAction.action.IsPressed();
+        currentCharge = 0f;
 
-        // Immediately stop all velocity
+        if (chargeVFX != null) chargeVFX.Play();
+        
+        if (chargeClip != null && mainAudioSource != null) 
+        {
+            mainAudioSource.clip = chargeClip;
+            mainAudioSource.volume = 0.2f; 
+            mainAudioSource.Play();
+        }
+
         rb.linearVelocity = Vector3.zero;
         rb.angularVelocity = Vector3.zero;
-
-        // Spike mass to resist incoming knockback
         rb.mass = baseMass * anchorMassMultiplier;
-        currentCharge = 0f;
     }
 
     private void OnAnchorReleased(InputAction.CallbackContext context)
     {
+        if (!isAnchored) return; 
+
         isAnchored = false;
-        rb.mass = baseMass; // Restore normal mass
+        rb.mass = baseMass;
+        cooldownTimer = actionCooldown; 
+
+        if (chargeVFX != null) chargeVFX.Stop();
+        
+        if (mainAudioSource != null)
+        {
+            mainAudioSource.Stop();
+            mainAudioSource.volume = 1.0f; 
+        }
+        
+        float expPowerMultiplier = 1f;
+        if (GameManager.Instance != null) expPowerMultiplier = 1f + (GameManager.Instance.currentEXP * 0.01f);
+
+        float chargeRatio = isSonicCharge ? (currentCharge / 100f) : (currentCharge / 50f);
+        float impulseForce = Mathf.Clamp(chargeRatio, 0.1f, 1f);
 
         if (isSonicCharge)
         {
-            // --- SONIC WAVE (AoE) ---
-            float finalExplosionForce = currentCharge * sonicExplosionMultiplier;
-            
-            // Find all colliders within the blast radius
+            if (sonicClip != null && mainAudioSource != null) mainAudioSource.PlayOneShot(sonicClip);
+            float finalExplosionForce = currentCharge * sonicExplosionMultiplier * expPowerMultiplier;
+
+            if (sonicVFX != null) sonicVFX.Play();
+            if (impulseSource != null) impulseSource.GenerateImpulse(impulseForce * 1.5f);
+
             Collider[] colliders = Physics.OverlapSphere(transform.position, sonicRadius);
             foreach (Collider hit in colliders)
             {
-                // If it has a rigidbody and is NOT the player, blast it away
                 if (hit.TryGetComponent<Rigidbody>(out Rigidbody targetRb) && targetRb != rb)
                 {
-                    // The '1f' parameter adds a slight upward lift to the knockback
                     targetRb.AddExplosionForce(finalExplosionForce, transform.position, sonicRadius, 1f, ForceMode.Impulse);
+                    if (hit.TryGetComponent<EnemyAI>(out EnemyAI enemyScript)) enemyScript.Stun(2.5f);
                 }
             }
         }
         else
         {
-            // --- LINEAR DASH ---
-            // Determine dash direction from current WASD direction; default forward if neutral
-            Vector3 burstDir = new Vector3(moveInput.x, 0f, moveInput.y).normalized;
-            if (burstDir == Vector3.zero)
+            if (dashClip != null && mainAudioSource != null) mainAudioSource.PlayOneShot(dashClip);
+            if (dashVFX != null) dashVFX.Play();
+            if (dashTrail != null)
             {
-                burstDir = Vector3.forward;
+                dashTrail.emitting = true;
+                Invoke(nameof(StopDashTrail), dashTrailDuration);
             }
 
-            // Apply explosive impulse based on accumulated charge
-            float impulseMagnitude = currentCharge * burstForceMultiplier;
+            if (impulseSource != null) impulseSource.GenerateImpulse(impulseForce);
+
+            Vector3 burstDir = new Vector3(moveInput.x, 0f, moveInput.y).normalized;
+            if (burstDir == Vector3.zero) burstDir = lastMoveDirection;
+
+            float impulseMagnitude = currentCharge * burstForceMultiplier * expPowerMultiplier;
             rb.AddForce(burstDir * impulseMagnitude, ForceMode.Impulse);
         }
 
         currentCharge = 0f;
         isSonicCharge = false;
     }
-    private void OnDrawGizmosSelected()
+
+    private void StopDashTrail()
     {
-        // Set the color of the wireframe
-        Gizmos.color = Color.cyan;
-        
-        // Draw the sphere at the player's current position using the sonicRadius variable
-        Gizmos.DrawWireSphere(transform.position, sonicRadius);
+        if (dashTrail != null) dashTrail.emitting = false;
+    }
+
+    private void OnCollisionEnter(Collision collision)
+    {
+        if (collision.rigidbody != null)
+        {
+            float momentumTransferred = collision.impulse.magnitude;
+            
+            currentEnergy += momentumTransferred * collisionEnergyMultiplier;
+            currentEnergy = Mathf.Clamp(currentEnergy, 0f, maxEnergy);
+
+            if (momentumTransferred > 10f) 
+            {
+                if (heavyImpactClip != null && mainAudioSource != null) mainAudioSource.PlayOneShot(heavyImpactClip);
+                if (collision.gameObject.TryGetComponent<EnemyAI>(out EnemyAI enemyScript)) enemyScript.Stun(2.0f);
+            }
+            else if (momentumTransferred > 2f)
+            {
+                if (lightImpactClip != null && mainAudioSource != null) mainAudioSource.PlayOneShot(lightImpactClip);
+            }
+            else if (momentumTransferred > 0.2f) 
+            {
+                if (normalImpactClip != null && mainAudioSource != null) mainAudioSource.PlayOneShot(normalImpactClip, 0.5f);
+            }
+        }
     }
 }
